@@ -4,7 +4,9 @@ Disable a few of the things Claude Code pushes into your context — and, more i
 
 [中文](README.md)
 
-This document is based on Claude Code `2.1.175`. By the time you read it the version has probably changed, so the point is not to copy the offsets, it is to copy the method.
+The examples were first taken from Claude Code `2.1.175`, and the script has been verified on `2.1.280`. By the time you read it the version has probably changed again, so the point is not to copy the offsets, it is to copy the method.
+
+> **If you have been using the old script on 2.1.258 or later, note this**: from 258 on, the old version errors out as soon as you run it with `currentDate gate is ambiguous (0, 0)`, and even when it does run, on 280 **the patch does not take effect** — see [Patched does not mean effective: bytecode](#patched-does-not-mean-effective-bytecode) for why. This version fixes both.
 
 ---
 
@@ -12,9 +14,10 @@ This document is based on Claude Code `2.1.175`. By the time you read it the ver
 
 - [What is being disabled](#what-is-being-disabled)
 - [Read this first: no decompilation involved](#read-this-first-no-decompilation-involved)
+- [Patched does not mean effective: bytecode](#patched-does-not-mean-effective-bytecode)
 - [Risks and boundaries](#risks-and-boundaries)
 - [How to search this file safely](#how-to-search-this-file-safely)
-- [Four examples](#four-examples)
+- [Six examples](#six-examples)
 - [The general method: what to do when a new version adds a new injection](#the-general-method-what-to-do-when-a-new-version-adds-a-new-injection)
 - [How to verify it actually took effect](#how-to-verify-it-actually-took-effect)
 - [Script usage](#script-usage)
@@ -24,7 +27,7 @@ This document is based on Claude Code `2.1.175`. By the time you read it the ver
 
 ## What is being disabled
 
-Claude Code inserts content you never asked for into the conversation, wrapped in `<system-reminder>` and sent to the model. Three kinds:
+Claude Code inserts content you never asked for into the conversation and sends it to the model, mostly wrapped in `<system-reminder>`. Five kinds:
 
 **1. Task reminders**
 
@@ -44,7 +47,17 @@ If your setup **starts a new process every turn** (the scripted `claude -p --res
 
 Anyone who just keeps a terminal open and chats will not hit this, because the process stays alive. Claude Code's own day-rollover fallback appends a `The date has changed...` line at the **end**, which leaves the prefix untouched — it is the restart-every-turn style of running it that bypasses that fallback.
 
-**If you do not start a new process every turn, you can leave this one alone.** Note that `--only` is a whitelist, not an exclude switch — to skip this one, list the other three instead: `--only task-text,task-logic,changed-files`.
+**If you do not start a new process every turn, you can leave this one alone.** Note that `--only` is a whitelist, not an exclude switch — to skip this one, list everything else you want instead, e.g. `--only task-text,task-logic,changed-files,user-email`.
+
+⚠️ **From 2.1.269 on, the date also has a separate `date` attachment of its own** (`Today's date is …`), sent out as an entry by itself. This patch only handles the field described above and cannot reach that one — measured on 2.1.280: with this patch applied, and with `--source-fallback` making the module it lives in run from source, the date is still in every request, just as in the original. **On newer versions, this one on its own can no longer turn the date off**; we keep it for older versions and for teaching (see [Example 4](#example-4-delete-an-object-property-22-bytes-changed)).
+
+**4. Account email (`userEmail`)**
+
+The context block in the first user message carries the line `The user's email address is …`. According to the source, it is only spliced in when you log in with a claude.ai account (OAuth); with an API key or `--bare` it is not there to begin with.
+
+**5. The pronouns section of the system prompt**
+
+The system prompt has a section that teaches the model how to use pronouns (`When you use a pronoun for someone …`). It is part of the system prompt itself, not a reminder. **This one is not disabled by default**; to disable it you have to name `pronouns` with `--only` — see [Risks and boundaries](#risks-and-boundaries) for why.
 
 ---
 
@@ -59,6 +72,32 @@ case"task_reminder":{if(!BJ())return[];
 ```
 
 So every operation described here is: **search for a string in plaintext, and replace some of its bytes with the same number of different bytes.** No decompilation, no disassembly, because none is needed.
+
+---
+
+## Patched does not mean effective: bytecode
+
+The previous section says the source is plaintext — that is true, but it is only half the story.
+
+Bun lets a module be stored in the executable **as both source and precompiled bytecode**. When bytecode is present, the loader runs the bytecode, and the source is only kept around for things like error stack traces. **What you edited is a copy that never runs**: the bytes changed, the size did not, `--version` runs, the script's two-state check goes green — every one of these holds, and the behavior has not changed at all.
+
+This is not a rare case. In 2.1.280, of the 2196 modules that carry source, 1973 also carry bytecode. **On 280, every code-changing patch in this repository (Examples 2–6) lands in the same bytecode-carrying module.** We measured it: with all of these patches applied and nothing else done, the email, the pronouns section and the file change notification appear in the requests the CLI sends exactly as many times as with the original (see [How to verify it actually took effect](#how-to-verify-it-actually-took-effect)).
+
+**How to tell**: look at whether the bytecode length in this module's record in Bun's module directory table is 0. Do not go by whether there is a `// @bun @bytecode` marker near the source, or how far away it is — that is the module header, and the distance tells you nothing. The table's structure, what its fields mean, and a read-only parser are covered in full in the sister repository [claude-code-ephemeral-reminders](https://github.com/lllq-123/claude-code-ephemeral-reminders/blob/main/README.en.md#buns-module-graph-why-the-source-edit-does-nothing), so we will not repeat them here.
+
+**What the script does now**:
+
+- After each hit it marks which module the hit is in and whether that module runs from bytecode, e.g. `@ module #333 (bytecode)`
+- When a selected patch lands in a bytecode module, it says outright that the change will not take effect
+- The optional flag `--source-fallback` (**off by default**): zeroes 16 bytes in that module's directory record (the offsets and lengths of the bytecode and module_info). With no bytecode to find, the loader falls back to running the source from the same record — that is, the copy that has already been patched. Not a single byte of the bytecode itself is touched, and the file size does not change
+
+`--source-fallback` is a switch for the **whole module**, so it only acts when it can say exactly "what will start taking effect next", and refuses otherwise:
+
+- The selected code-changing patches must all be in the same module
+- If this module has a patch that was **applied before but not selected this time**, it refuses — falling back would make that earlier change, which never took effect, suddenly take effect
+- If the module has no bytecode but those 16 bytes are not 0, it refuses — it cannot read that
+
+For the cost, and what it does not cover, see [Limits and known issues](#limits-and-known-issues).
 
 ---
 
@@ -79,16 +118,18 @@ One of them:
 The technical boundaries of these changes:
 
 - **Signature verification is not touched**, nor is any authentication logic
-- **Network requests are not touched**; nothing sent to the server is changed
+- **Network requests are not touched.** Of what gets sent to the server, only things spliced in locally are removed; nothing is added or rewritten
 - What's changed is mainly **what the local process puts into context** (Example 3 has one exception, see below)
 - The model itself is not changed, and no tools are removed
 
-### The four examples are not all the same kind of change
+### The six examples are not all the same kind of change
 
-(The example numbers mentioned here are explained in the [Four examples](#four-examples) section below.)
+(The example numbers mentioned here are explained in the [Six examples](#six-examples) section below.)
 
 - **Example 1** is a pure text replacement: a block of prompt text becomes the same number of spaces, with no code logic touched.
-- **Examples 2, 3 and 4** change the code itself — a conditional, a function call, an object property. They are still equal-length byte replacements, but they change the program's execution path, which is one level deeper than blanking out a piece of text.
+- **Examples 2, 3, 4 and 5** change the code itself — a conditional, a function call, an object property, a value expression. They are still equal-length byte replacements, but they change the program's execution path, which is one level deeper than blanking out a piece of text.
+- **Example 6** removes **a section of the system prompt**. It is not a reminder; it is behavioral guidance written for the model. That goes one level deeper again than removing a reminder, so the script does not apply it by default — you have to name it with `--only pronouns`.
+- **`--source-fallback`** changes not JS code but **metadata the loader reads** (the module directory table) — what it changes is not what the program does, but how the program gets loaded. That is a separate tier, so it is also off by default.
 
 If you only want the most conservative tier, use `--only task-text`.
 
@@ -99,13 +140,13 @@ Rules you have to follow in practice:
 - **Always keep a backup.** The script automatically creates a timestamped backup before every write
 - **Replacements must be equal-length.** Changing the file size breaks ELF section offsets and the binary will not run at all
 - **Always verify it starts.** The script runs `--version` once before the replacement takes effect
-- **If you cannot read it, do not touch it.** The script runs a two-state check on three structural targets and refuses to act when the state is ambiguous (see below)
+- **If you cannot read it, do not touch it.** The script runs a two-state check on structural targets and refuses to act when the state is ambiguous (see below)
 
 ---
 
 ## How to search this file safely
 
-This is a 249MB file. Three hard rules, every one of them learned the hard way:
+This is a file of over two hundred MB (249MB on 2.1.175, 234MB on 2.1.280). Three hard rules, every one of them learned the hard way:
 
 **1. Never read the whole thing into memory**
 
@@ -148,7 +189,7 @@ If you really do need to search repeatedly, run `strings` **once, out to a text 
 
 ### Not every hit is code
 
-Searching for any single line of UI text hits **2 places**. Searching for a minified identifier hits, on top of the real code references, **one extra place: a symbol name table**:
+Searching for any single line of UI text hits **2 places**. Searching for a minified identifier hits, on top of the real code references, **one extra place: a symbol name table** (the offsets in the table below are from 2.1.175 and change with every version; how to recognize each one does not):
 
 | Location | What it is | How to recognize it |
 |---|---|---|
@@ -156,7 +197,7 @@ Searching for any single line of UI text hits **2 places**. Searching for a mini
 | Low offset (~139 million) | JSC string constant table | tabs and high bytes mixed in; template interpolation points are control characters |
 | Low offset (~105 million) | symbol name table | a long run of short identifiers packed side by side, separated by tabs, with no JS syntax at all |
 
-**To change behavior, touch only the JS source hit.** If all you want is to blank out the text, both of the first two have to be blanked.
+**To change behavior, touch only the JS source hit** — provided that source actually runs; see [Patched does not mean effective](#patched-does-not-mean-effective-bytecode). If all you want is to blank out the text, both of the first two have to be blanked.
 
 The symbol name table looks like this; do not count it as a reference:
 
@@ -168,9 +209,11 @@ A concrete case: searching for the minified name `Rv7` hits 3 places, one of whi
 
 ---
 
-## Four examples
+## Six examples
 
-Ordered by increasing difficulty. Every one of them is a change that actually takes effect on 2.1.175.
+Ordered by increasing difficulty. Examples 1–4 are changes measured to take effect on 2.1.175; Examples 5 and 6 are new on 2.1.280.
+
+**On 2.1.280, the module that Examples 2–6 live in runs from bytecode, so they only take effect together with `--source-fallback`** (see [Patched does not mean effective](#patched-does-not-mean-effective-bytecode)). The minified names in the code snippets below each belong only to their own version.
 
 ### Example 1: blank out a piece of text (easiest)
 
@@ -194,7 +237,9 @@ We assumed at first that the model would not make sense of this leftover fragmen
 
 **It is not harmless noise. It continuously consumes attention and generates false alarms.**
 
-Conclusion: blanking the text is not enough. Either the whole thing disappears, or you disable it where it is generated. The three examples below are all the latter.
+Conclusion: blanking the text is not enough. Either the whole thing disappears, or you disable it where it is generated. The examples below are all the latter.
+
+⚠️ On 2.1.280, each of these three pieces of text hits 2 places: one in the source of a module that runs from bytecode, the other not in any module's source (the bytecode's data area). The script blanks both, but **we have not verified on 280 what effect blanking them has on behavior** — the task reminder only fires after more than ten turns of tool calls in a row, and this round of verification did not cover it.
 
 ### Example 2: disable a conditional (4 bytes changed)
 
@@ -232,11 +277,44 @@ JS object literals allow a trailing comma, so this property simply disappears wi
 
 **Why not write in a fixed fake date**: it would replay the Example 1 trap. The crippled string left in the binary gets legitimately blocked by the model as a prompt injection, and generates false alarms on top of that. Either the whole thing disappears, or leave it alone.
 
+⚠️ **On newer versions this example is no longer enough; it stays here as history and teaching material**:
+
+- **From 2.1.258 on, the code is written differently**: the outer rewriting function is gone, replaced by a template literal that builds the sentence directly: `` currentDate:`Today's date is ${Zfe()}.` ``. The old script's regex does not recognize it, the two-state check gets `(0, 0)`, and so it refuses to act — that is the check working correctly. This version of the script recognizes both forms.
+- **From 2.1.269 on, the date also comes in a separate `date` attachment.** Measured on 2.1.280: with this patch applied and the module also falling back to source, every request still contains `Today's date is …`. **This patch alone can no longer turn the date off**, and this repository does not handle that attachment.
+
+### Example 5: make a value always empty (email, 19 bytes changed)
+
+2.1.280:
+
+```
+old: ANTHROPIC_UNIX_SOCKET?void 0:xn()?.emailAddress,
+new: ANTHROPIC_UNIX_SOCKET?void 0:void 0,            
+```
+
+This assigns a value to a variable: `undefined` when the `ANTHROPIC_UNIX_SOCKET` environment variable is set, otherwise the account's email is read. Replace the email-reading half with `void 0,` plus spaces and the variable is always `undefined`, so the branch further on that builds the `The user's email address is …` line is never entered.
+
+The anchors are the environment variable name `ANTHROPIC_UNIX_SOCKET` and the property name `.emailAddress` — neither of them gets minified.
+
+### Example 6: make a system-prompt section return nothing (pronouns, 10 bytes changed)
+
+2.1.280:
+
+```
+old: qd("pronouns",()=>tVn)
+new: qd("pronoun",()=>null)
+```
+
+The system prompt is registered section by section: a section name, plus a function that returns that section's content. A section whose function returns `null` is filtered out when the system prompt is assembled.
+
+The hard part is keeping it equal-length. Replacing `()=>tVn` with `()=>null` adds 1 byte, so the section name `"pronouns"` is shortened by 1 byte to `"pronoun"` to make up for it. **The variable name's length differs from version to version**, so how many bytes to cut is computed from the variable name actually matched; when the variable name is longer than 4 characters, shortening the section name cannot make up the difference, and the script refuses to act.
+
+**Why it is not applied by default**: what it removes is a section of the system prompt itself, not a reminder. This section is behavioral guidance Anthropic wrote for the model, and turning it off changes how the model talks. Whether to turn it off is your call; the script only touches it when `--only` names `pronouns`.
+
 ---
 
 ## The general method: what to do when a new version adds a new injection
 
-The four above belong to 2.1.175. This section is what this repository is really here to give you.
+The examples above are all tied to specific versions. This section is what this repository is really here to give you.
 
 ### Step 1: confirm how it gets in
 
@@ -274,7 +352,13 @@ TASK_LOGIC_LIVE = re.compile(
 
 What `(?P<target>...)` captures is exactly the span to replace, and its length comes from the match result, so you never count by hand.
 
-### Step 3: establish the scope, do not change one number and break three features
+### Step 3: confirm that source actually runs
+
+After you have found the location and before you act, check whether the module it is in runs from bytecode (see [Patched does not mean effective](#patched-does-not-mean-effective-bytecode)). If it does, editing the source has no effect whatsoever: either give up, or make the whole module fall back to running from source and accept the cost described in [Limits and known issues](#limits-and-known-issues).
+
+**When "I patched the right place" and "the behavior did not change" are both true, suspect the execution path first, not that you found the wrong place.**
+
+### Step 4: establish the scope, do not change one number and break three features
 
 A constant name is globally unique, but one constant may feed several features. Enumerate its references before you change anything:
 
@@ -282,7 +366,7 @@ Search for the constant name → rule out the symbol-name-table hit → what rem
 
 Skip this step and you may change one number and break three features.
 
-### Step 4: pick an equal-length editing technique
+### Step 5: pick an equal-length editing technique
 
 After the edit the file size has to match to the byte. Three techniques:
 
@@ -296,7 +380,7 @@ The third one is free: changing `1e4` to `1e5` turns 10000 into 100000, and both
 
 For a decimal form like `50000`, you can switch to `5e4` and pad with spaces — `50000` is 5 bytes, `5e4` is 3 bytes, so you **pad 2 spaces**. Pad exactly the difference, count it again every single time before you write, and do not copy someone else's numbers.
 
-### Step 5: two-state check, refuse to act when you cannot read it
+### Step 6: two-state check, refuse to act when you cannot read it
 
 This is the one part of the whole method most worth copying.
 
@@ -322,7 +406,7 @@ That backup had in fact **already been patched by a much earlier version** — o
 
 Without this check, the script would read "no live form found" as "nothing to change" — or worse, write bytes at the wrong location.
 
-### Step 6: patch a copy, replace atomically
+### Step 7: patch a copy, replace atomically
 
 At any moment there may be dozens of processes on the machine holding this file open. And Linux does not allow writing to a file that is executing (`ETXTBSY`).
 
@@ -349,13 +433,41 @@ The cost is that they need a restart before it takes effect — **a reminder sti
 
 Attachments are stored in the jsonl only as structured objects; the rendered text never hits disk. The jsonl looks exactly the same before and after.
 
-### It starts ≠ it is not broken
+### It starts ≠ it is not broken, the check goes green ≠ it took effect
 
-`--version` only proves the ELF still loads. What you need to verify is that a full multi-turn session runs without errors.
+`--version` only proves the ELF still loads. The bytes changed, the size did not, the two-state check went green — in a module that runs from bytecode every one of these holds, and yet the behavior has not changed at all (see [Patched does not mean effective](#patched-does-not-mean-effective-bytecode)). **Only a difference in the requests the CLI actually sends counts as evidence that it took effect.**
 
-### The only workable observation point: ask the session running the test what it sees
+### Capture the request bodies and count: a local fake-server comparison
 
-It can see its own context. But **you have to run an A/B comparison**: run the same prompt once on the original and once on the patched version. Testing only the patched one and getting "I don't see it" is a false negative — the model may simply not have mentioned it.
+`examples/mockprobe.py` starts a fake API server on this machine, points the CLI at it, saves every request exactly as received, and counts how many times the email, the pronouns section, the file change notification and the date appear in them. **Run it once on the original and once on the patched version, and compare the numbers.**
+
+```bash
+python3 examples/mockprobe.py /path/to/original-claude original
+python3 examples/mockprobe.py /path/to/patched-claude  patched
+```
+
+Nothing leaves this machine and nothing costs money: the CLI only connects to `127.0.0.1`; the outbound proxy points at a port nobody is listening on; HOME and the config directory are freshly created temporary ones with none of your real credentials in them; the token is a fake string, and the fake server never even looks at it.
+
+Measured on 2.1.280 (3 conversation turns and 7 requests per side; each number is the total count of occurrences across the 7 requests):
+
+| | Original | Patched, without `--source-fallback` | Patched, with it |
+|---|---|---|---|
+| Account email | 7 | 7 | 0 |
+| Pronouns section | 7 | 7 | 0 |
+| File change notification (`edited_text_file`) | 3 | 3 | 0 |
+| Date (`Today's date is`) | 7 | 7 | 7 |
+| Time until the first request is sent | 0.37 s | 0.35 s | 0.58 s |
+
+The middle column is "patched does not mean effective" in action: every patch in place, every check green, and what gets sent is the same as the original. The date is there in all three columns; see [Example 4](#example-4-delete-an-object-property-22-bytes-changed) for why. With the fallback on, comparing the first request character by character against the original shows only two differences: the system prompt is missing the pronouns section, and the first message is missing the email block.
+
+A few pitfalls:
+
+- **Do not use `--bare` or an API key when checking the email**: according to the source, the email is never spliced in in those two cases, so the original is 0 too and the comparison means nothing. mockprobe uses a fake OAuth token plus a fake account (the email domain is `example.invalid`).
+- **Do not use `--system-prompt` when checking the pronouns section**: it replaces the default system prompt wholesale, so the pronouns section is not in the original either.
+- **To verify the file change notification on 280, the positive control has to use Write, not Read**: 280's collector skips read records that carry an offset/limit, and Read records an offset, so "Read, then modify the file externally" produces no notification on either side. mockprobe's tool plan includes both, and you can see that only the file written with Write gets a notification.
+- **The outbound proxy points at a port nobody is listening on**: if some request does not go through `ANTHROPIC_BASE_URL`, it fails outright instead of quietly going out. Requests that hit other paths are recorded in `other_endpoints`, which was empty this time.
+
+Earlier, our method was to ask the session running the test "what do you see"; that requires an A/B comparison, and it depends on how the model answers — it may see something and still not mention it. Capturing the request bodies is more direct.
 
 ### Mind the trigger conditions
 
@@ -369,7 +481,7 @@ If what you changed is a behavioral threshold rather than a piece of text, you c
 
 ## Script usage
 
-`strip_injections.py` turns the four examples above into a script you can run repeatedly.
+`strip_injections.py` turns the six examples above into a script you can run repeatedly.
 
 **Requires Python 3.10 or newer** (it uses `X | None` type annotations, so 3.9 and below fail outright on import). Standard library only, no third-party dependencies.
 
@@ -377,24 +489,36 @@ If what you changed is a behavioral threshold rather than a piece of text, you c
 # See what would change, without writing anything
 python3 strip_injections.py --dry-run
 
-# Apply all of them
+# Apply the default set (everything except pronouns)
 python3 strip_injections.py
 
-# Disable only the date, leave the other three alone
+# Disable only the date, leave the rest alone
 python3 strip_injections.py --only current-date
 
-# Comma-separated to select more than one
-python3 strip_injections.py --only task-logic,current-date
+# Comma-separated to select more than one; pronouns is only applied when named like this
+python3 strip_injections.py --only user-email,pronouns
+
+# Make the patches actually take effect on versions like 2.1.280 (see "Patched does not mean effective")
+python3 strip_injections.py --source-fallback
 
 # Installed somewhere else
 python3 strip_injections.py --versions-dir /path/to/claude/versions
 ```
 
-The four names: `task-text`, `task-logic`, `changed-files`, `current-date`.
+The six names: `task-text`, `task-logic`, `changed-files`, `current-date`, `user-email`, `pronouns`. Without `--only`, the first five are applied.
+
+In the output, each item is followed by which module it lands in and whether that module runs from bytecode:
+
+```
+  user email:    1 live / 0 disabled  @ module #333 (bytecode)
+  ! bytecode: task-logic, current-date, changed-files, user-email
+    sit in a module that runs from bytecode, so editing their source text
+    has no effect at runtime. See --source-fallback.
+```
 
 The full sequence:
 
-4MB streaming scan (never reads the whole file) → two-state check (refuse on ambiguity) → create a timestamped backup → copy to a temporary file → assert equal length at each write, **then compare the original bytes at that site** → check that the total size is unchanged → run `--version` → atomically replace the inode → **re-scan the entire file afterwards to re-verify**.
+4MB streaming scan (never reads the whole file) → two-state check (refuse on ambiguity) → read the Bun module table and mark which module each site is in (read-only) → with `--source-fallback` on, check whether falling back is possible (refuse if not) → create a timestamped backup → copy to a temporary file → assert equal length at each write, **then compare the original bytes at that site** → check that the total size is unchanged → run `--version` → atomically replace the inode → **re-scan the entire file afterwards to re-verify**.
 
 Two of those steps deserve a separate word:
 
@@ -426,9 +550,15 @@ If you have auto-update turned off like we do, you can otherwise leave it alone.
 
 **Do not turn on `--skip-version-check` in normal use.** Its only reason to exist is testing the script itself against fake fixtures (a fake file cannot execute, so `--version` is guaranteed to fail). Turning it on means giving up the "does the patched binary still start" check.
 
-**When `--only task-text` is used on its own**, the two-state check still runs against all three structural targets. That is deliberate: that check answers "can I read this binary", not "do I want to patch here".
+**When `--only task-text` is used on its own**, the two-state check still runs against the original three structural targets (task-logic, current-date, changed-files). That is deliberate: that check answers "can I read this binary", not "do I want to patch here". The later additions `user-email` and `pronouns` are only checked when selected, so that older versions without these two sites do not get refused along with them.
 
-**The version number will go stale.** Every offset and minified name in this document (`BJ`, `Xc4`, `T07`, `yPH`) belongs to 2.1.175 only, and is there for understanding. The script locates by structure and does not depend on them.
+**The cost of `--source-fallback`**: the whole module switches to parsing its source. Measured on 2.1.280, a full startup up to sending the first request is about 0.21 seconds slower (0.37 → 0.58 s); fast paths like `--version` are not affected.
+
+**Patches that never took effect will come back to life.** The fallback is a switch for the whole module: any change in that module that was **applied earlier and never took effect** will take effect along with the rest once it falls back. The script checks the patches it knows (see the refusal conditions in [Patched does not mean effective](#patched-does-not-mean-effective-bytecode)), but **it cannot recognize places changed by other tools or by hand**. If you are not sure, start over from the official original: download a clean copy and patch it only with this script.
+
+**The date cannot be fully turned off.** See [Example 4](#example-4-delete-an-object-property-22-bytes-changed): from 2.1.269 on, the date also comes in a separate attachment, which this repository does not handle.
+
+**The version number will go stale.** Every offset and minified name in this document (175's `BJ`, `Xc4`, `T07`, `yPH`; 280's `xn`, `qd`, `tVn` and module number `#333`) belongs only to its own version, and is there for understanding. The script locates by structure and does not depend on them.
 
 ---
 
